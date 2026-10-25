@@ -69,6 +69,10 @@ class EmissionDeadlines(Contract):
     @field_validator('fixture_posting_cutoff_mach_seconds', 'assignment_expires_unix')
     @classmethod
     def finite_double(cls, value):
+        # Bare integer JSON tokens use Foundation's decimal parsing path.
+        # Keep them within NSNumber's signed 64-bit domain; do not coerce/hash-change them.
+        if isinstance(value, int) and value > 2**63 - 1:
+            raise ValueError('Integer deadline must fit a signed 64-bit JSON number')
         try:
             finite = math.isfinite(float(value))
         except OverflowError:

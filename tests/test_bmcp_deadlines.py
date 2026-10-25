@@ -383,8 +383,10 @@ def test_expiry_cannot_disguise_reused_application_owner(tmp_path, bound, clock,
 
 
 @pytest.mark.parametrize('field', ['fixture_posting_cutoff_mach_seconds', 'assignment_expires_unix'])
-@pytest.mark.parametrize('value', [10**400, 10**309, 2**1024, float('inf'), float('-inf'), float('nan')],
-                         ids=['int400', 'int309', 'double-overflow', 'infinity', 'negative-infinity', 'nan'])
+@pytest.mark.parametrize('value', [10**400, 10**309, 2**1024, 10**308, int(sys.float_info.max), 2**63, 2**64-1,
+                                   float('inf'), float('-inf'), float('nan')],
+                         ids=['int400', 'int309', 'double-overflow', 'int308', 'max-double-int',
+                              'signed64-overflow', 'unsigned64', 'infinity', 'negative-infinity', 'nan'])
 def test_non_double_deadlines_refused_before_acquisition(tmp_path, bound, field, value):
     bound['emission_deadlines'][field] = value
     with pytest.raises(ValueError):
@@ -405,10 +407,10 @@ def test_non_double_deadlines_refused_before_acquisition(tmp_path, bound, field,
 
 
 @pytest.mark.parametrize('field', ['fixture_posting_cutoff_mach_seconds', 'assignment_expires_unix'])
-@pytest.mark.parametrize('value', [1, 420, 1.25, 420.0, 10**308, int(sys.float_info.max),
+@pytest.mark.parametrize('value', [1, 420, 1.25, 420.0, 2**53+1, 2**63-1,
                                    sys.float_info.max, float.fromhex('0x0.0000000000001p-1022')],
-                         ids=['one', 'ordinary-int', 'fraction', 'ordinary-float', 'large-int',
-                              'largest-double-int', 'largest-double', 'smallest-positive-double'])
+                         ids=['one', 'ordinary-int', 'fraction', 'ordinary-float', 'int53-plus-one',
+                              'signed64-max', 'largest-double', 'smallest-positive-double'])
 def test_finite_double_deadlines_preserve_original_values_and_hash(bound, field, value):
     bound['emission_deadlines'][field] = value
     prepared = preview(bound)
@@ -416,3 +418,66 @@ def test_finite_double_deadlines_preserve_original_values_and_hash(bound, field,
     assert type(actual) is type(value) and actual == value
     assert canonical(prepared['recipe']) == canonical(bound)
     assert prepared['recipe_hash'] == recipe_hash(bound)
+
+
+def run_deadline_parser_matrix(parser, output):
+    """Explicit opt-in inert parser check; never run by the ordinary pytest suite.
+
+    parser must be the unchanged native definitions + ControlledRequest-only main,
+    compiled SOFTWARE_PEN_INERT_BUILD and checked for no CGEventPost import.
+    """
+    import subprocess
+    output = Path(output).resolve()
+    cases = [('ordinary-int', 420), ('ordinary-float', 420.25), ('int53-plus-one', 2**53+1),
+             ('signed64-max', 2**63-1), ('signed64-plus-one', 2**63), ('unsigned64-max', 2**64-1),
+             ('int165', 10**165), ('int166', 10**166), ('int308', 10**308),
+             ('max-double-int', int(sys.float_info.max)), ('int400', 10**400),
+             ('max-double-float', sys.float_info.max),
+             ('min-positive-float', float.fromhex('0x0.0000000000001p-1022'))]
+    rows = []
+    baseline = None
+    for field in ('fixture_posting_cutoff_mach_seconds', 'assignment_expires_unix'):
+        for label, value in cases:
+            payload = recipe.__wrapped__()
+            payload['emission_deadlines'] = dict(fixture_posting_cutoff_mach_seconds=420., assignment_expires_unix=1100.)
+            payload['emission_deadlines'][field] = value
+            try:
+                preview(payload)
+                accepted = True
+            except ValueError:
+                accepted = False
+            with pytest.MonkeyPatch.context() as patch:
+                fake_clock = clock.__wrapped__(patch)
+                fake_clock.mach = fake_clock.unix = 0
+                directory = output / ('m' + str(len(rows)))
+                directory.mkdir(mode=0o700)
+                if accepted:
+                    transport = InertTransport(directory, fake_clock, patch, ready_delay=0)
+                    idle.__wrapped__(patch)(transport)
+                    result = transport.run(payload)
+                    assert result['outcome'] == 'completed', result
+                    request_path = directory / 'one' / 'request.json'
+                    raw = request_path.read_bytes()
+                    baseline = (raw, request_path)
+                    assert json.loads(raw)[field] == value
+                else:
+                    # Refused inputs cannot produce a request. Probe the parser by
+                    # replacing only the numeric token in a real producer request.
+                    raw, request_path = baseline
+                    obj = json.loads(raw)
+                    obj[field] = value
+                    raw = canonical(obj).encode()
+                input_path = directory / 'parser-input.json'
+                input_path.write_bytes(raw)
+                native = subprocess.run([str(parser), str(input_path), str(request_path)],
+                                        capture_output=True, text=True, check=True).stdout.strip()
+                row = dict(field=field, case=label, token=canonical(value), public_accepted=accepted,
+                           exact_producer_bytes=accepted, native=native)
+                rows.append(row)
+                (output / 'producer-parser-matrix.json').write_text(json.dumps(rows, indent=2))
+                expected_public = label in {'ordinary-int', 'ordinary-float', 'int53-plus-one',
+                                            'signed64-max', 'max-double-float', 'min-positive-float'}
+                assert accepted is expected_public, row
+                expected_native = label not in {'int166', 'int308', 'max-double-int', 'int400'}
+                assert (native == 'ACCEPT') is expected_native, row
+    return rows
