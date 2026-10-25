@@ -100,3 +100,54 @@ until it exits; restarted jobs stay UNKNOWN and block replay. Parent must verify
 emitter exit and native release before reconciliation. A restarted Blender or
 changed file/object invalidates old session recovery; checkpoint manifests are
 session-local. No transactional Undo or safe-mode socket security is promised.
+
+## App custody implementation round
+
+Source and inert host tests only. This round adds an optional app-launch backend;
+it does not install PyObjC, launch an application, operate Blender, send input,
+change permissions/settings, or rebuild/sign/replace the approved emitter.
+The parent owns the combined independent review and every native gate.
+
+The implementation retains the NSWorkspace completion application and late
+callback ticket before fallible metadata work. Cocoa queries refresh through the
+host main run loop, with bounded worker waits. Kernel peer UID/PID/audit token,
+fresh application equality/liveness and executable bytes are checked before
+authorization; dynamic LOCAL_PEERTOKEN attribution alone is insufficient.
+SQLite authorization intent precedes dispatch. Cancellation/disconnect and
+metadata failures preserve uncertain ownership without PID signalling or replay.
+Unknown exit keeps a retained ticket and read-only lifetime supervisor.
+
+The frozen v1 READY/FINISHED keysets, strict types, exact byte hashes and current
+native receipt footer are implemented as documented in the integration packet.
+Only complete, consistent sender accounting plus actual retained application
+termination can clear a lease. Receiver delivery, native release, applied effect
+and form are never inferred from these host facts. PREPARE-only is the default;
+authorization to post requires a separate explicit configuration flag.
+
+Final verification after recovery:
+
+- `.venv/bin/python -m pytest -q`: **688 passed, 6 failed, 1 skipped** (34.74s).
+  All six failures are the previously documented compatibility cases
+  `test_addon_status_always_answers`: missing `blender_mcp.config`. No private
+  config was copied or created. The suite includes 76 new inert custody tests
+  and all 58 prior extension tests.
+- The new tests exercise fake app/IPC identity mismatches, changing peer
+  attribution, stale app objects, changed executable bytes, absent READY,
+  authorization refusal, cancellation, disconnect/timeouts, lost responses,
+  metadata failures, uncertain/late exit, strict frames and receipt accounting,
+  durable intent, lease retention/release, deduplication and no replay. Public
+  MCP cancelled-await/status/cancel behavior and fake Cocoa run-loop refresh are
+  covered. Private local AF_UNIX endpoints connect only host mocks.
+- `UV_CACHE_DIR=/private/tmp/bmcp-uv-cache uv lock --check --offline`: passes.
+  Optional Cocoa dependency resolves to 12.2.2; it remains uninstalled here.
+- `UV_CACHE_DIR=/private/tmp/bmcp-uv-cache uv build --wheel --out-dir
+  /private/tmp/bmcp1-custody-dist`: passes. Wheel copies of both new modules,
+  coordinator, MCP wrapper and bundled addon match source byte-for-byte.
+  Root/bundled addon parity is unchanged. `git diff --check` passes.
+
+A transient disk-full condition interrupted a here-document before its changes
+or test run began. Preserved work was resumed without reverting or recreating
+it; the final checks above ran after capacity recovered. Actual Cocoa launch,
+main-run-loop refresh, kernel attribution and native cancellation/release remain
+unverified on the app route. Original426 compile/link evidence and these fakes
+are not native acceptance. No extra review agent was started.

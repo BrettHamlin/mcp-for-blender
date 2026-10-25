@@ -9,6 +9,7 @@ from pydantic import StrictBool
 
 from .pen import QuartzBackend, Recipe, preview
 from .pen_jobs import PenJobs
+from .pen_custody import AppQuartzBackend
 
 
 def register(mcp, connection):
@@ -22,7 +23,7 @@ def register(mcp, connection):
         return blender.send_command('bmcp_control', {'action': action, 'params': params},
                                     read_only=action == 'inspect')
 
-    def jobs():
+    def jobs(main_loop=None):
         nonlocal coordinator
         with coordinator_lock:
             if coordinator is None:
@@ -31,7 +32,14 @@ def register(mcp, connection):
                 sha = os.environ.get('BMCP_PEN_SHA256')
                 if not root or not os.path.isabs(root) or not executable or not sha:
                     raise ValueError('Configure BMCP_JOB_ROOT, BMCP_PEN_EXECUTABLE and BMCP_PEN_SHA256 explicitly')
-                coordinator = PenJobs(root, QuartzBackend(executable, sha), control)
+                app = os.environ.get('BMCP_PEN_APP')
+                if app:
+                    backend = AppQuartzBackend(app, executable, sha,
+                        allow_emission=os.environ.get('BMCP_PEN_ALLOW_AUTHORIZED_EMISSION') == '1',
+                        main_loop=main_loop)
+                else:
+                    backend = QuartzBackend(executable, sha)
+                coordinator = PenJobs(root, backend, control)
             return coordinator
 
     @mcp.tool()
@@ -73,25 +81,30 @@ def register(mcp, connection):
     @mcp.tool()
     async def pen_execute(request_id: str, recipe: Recipe, expected_recipe_hash: str) -> dict:
         """Dispatch one hash-bound contact asynchronously. Same ID/payload returns existing job, never replays."""
-        return await asyncio.to_thread(lambda: jobs().execute(request_id, recipe.model_dump(mode='json', by_alias=True), expected_recipe_hash))
+        main_loop = asyncio.get_running_loop()
+        return await asyncio.to_thread(lambda: jobs(main_loop).execute(request_id, recipe.model_dump(mode='json', by_alias=True), expected_recipe_hash))
 
     @mcp.tool()
     async def pen_status(request_id: str) -> dict:
         """Read persisted job and separate evidence layers. Missing receiver/effect evidence is UNKNOWN."""
-        return await asyncio.to_thread(lambda: jobs().status(request_id))
+        main_loop = asyncio.get_running_loop()
+        return await asyncio.to_thread(lambda: jobs(main_loop).status(request_id))
 
     @mcp.tool()
     async def pen_cancel(request_id: str) -> dict:
-        """Request SIGTERM cleanup from a live emitter; return promptly. Native release is not guaranteed."""
-        return await asyncio.to_thread(lambda: jobs().cancel(request_id))
+        """Request owned emitter cleanup; return promptly. Native release is not guaranteed."""
+        main_loop = asyncio.get_running_loop()
+        return await asyncio.to_thread(lambda: jobs(main_loop).cancel(request_id))
 
     @mcp.tool()
     async def pen_reconcile(request_id: str, native_release_verified: StrictBool, note: str) -> dict:
         """Release an unresolved lease only after external verification of emitter exit and native release; never replays."""
-        return await asyncio.to_thread(lambda: jobs().reconcile(request_id, native_release_verified, note))
+        main_loop = asyncio.get_running_loop()
+        return await asyncio.to_thread(lambda: jobs(main_loop).reconcile(request_id, native_release_verified, note))
 
     @mcp.tool()
     async def pen_record_evidence(request_id: str, layer: str, verdict: str, artifact: str,
                             sha256: str, reviewer: str) -> dict:
         """Attach an external received/applied/form review with a hash-verified job-local artifact. Does not promote machine UNKNOWN."""
-        return await asyncio.to_thread(lambda: jobs().record_evidence(request_id, layer, verdict, artifact, sha256, reviewer))
+        main_loop = asyncio.get_running_loop()
+        return await asyncio.to_thread(lambda: jobs(main_loop).record_evidence(request_id, layer, verdict, artifact, sha256, reviewer))

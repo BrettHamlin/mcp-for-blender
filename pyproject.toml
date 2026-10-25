@@ -17,6 +17,9 @@ dependencies = [
     "httpx>=0.27.0",
 ]
 
+[project.optional-dependencies]
+pen-app = ["pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'"]
+
 [project.scripts]
 mcp-for-blender = "blender_mcp.server:main"
 

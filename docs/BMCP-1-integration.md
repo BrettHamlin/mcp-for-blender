@@ -92,7 +92,7 @@ exclusive upper/right bounds preserve the existing native limits. Curved and
 pressure-varying paths are passed unchanged; use an existing authoring tool to
 sample them. No new curve/event generator was copied into the fork.
 
-The real adapter invokes this stable CLI directly, without a shell:
+The legacy direct-executable adapter invokes this CLI without a shell:
 
 ```
 QuartzPen --input <job>/stroke.json --bounds X Y WIDTH HEIGHT --emit --target-pid PID
@@ -150,7 +150,7 @@ acquire response also requires reconciliation even if nothing was posted.
 Native input cannot be atomically bound to a Blender state hash; there is a
 small acquire-to-process-start interval and no native file/object check per event.
 
-`pen_cancel` requests cancellation. The adapter sends SIGTERM to its own process
+`pen_cancel` requests cancellation. The legacy direct adapter sends SIGTERM to its own process
 handle and waits for cleanup; after 20 seconds it also requests SIGTERM, allowing
 five seconds to exit. It never SIGKILLs, signals a recovered PID, or injects an
 extra contact. If the process does not exit, or logs do not show both zero-pressure
@@ -205,3 +205,99 @@ catalog. Durable job records survive; native recovery acceptance is pending.
 
 A useful initial PR can be source-reviewed and host-tested with all seven native
 gates still pending. Do not merge as native-validated based on these host tests.
+
+## App custody adapter (source-only preparation)
+
+`BMCP_PEN_APP` selects the new `AppQuartzBackend`; it never falls back to the
+legacy direct-Popen route if application custody fails. Pin the canonical existing
+`.app` path, its `Contents/MacOS` executable and executable SHA256. The legacy
+route described above remains available for compatibility, but does not repair
+MCP424's observed launch-route access mismatch. No wrapper or file-reported PID
+stands in for the application object.
+
+The optional `pen-app` dependency supplies PyObjC Cocoa (lock resolves 12.2.2).
+It was absent from the implementation environment; no Cocoa package was installed
+or native app launched for these tests. The source bridge uses
+[NSWorkspace's completion callback](https://developer.apple.com/documentation/appkit/nsworkspace/openapplication(at:configuration:completionhandler:))
+with `createsNewApplicationInstance=true`, retaining its actual application even
+when completion is late or metadata persistence fails. Cocoa calls run on the
+MCP host's main asyncio loop, with a nonblocking Cocoa main-run-loop turn and a
+bounded worker wait. This is the host process, not Blender's main thread.
+[NSRunningApplication properties](https://developer.apple.com/documentation/appkit/nsrunningapplication)
+require those run-loop turns to refresh; background polling alone is insufficient.
+The bridge has only fake-framework coverage. Runtime callback delivery, property
+refresh and platform identity behavior remain unverified.
+
+The controller implements software-pen-custody/v1 from original427's stable
+synthesis, read-only provenance SHA256
+`64bfaf2c551225861b3b0d4587d98a4afbf4910d8c199889f92ba91bdcba1e85`.
+Original426 established native API compile/link evidence only. No original source
+or emitter binary is copied, rebuilt, signed, installed or replaced here.
+
+A private owned 0700 job directory contains exclusive 0600 stroke/request files;
+the socket is 0600 in a separate short canonical 0700 directory under
+`/private/tmp`. Endpoint and accepted descriptors are close-on-exec. Exact request
+bytes, stroke bytes, opaque recipe hash, durable acquisition UUID and fresh
+challenge bind all frames. One strict UTF-8 LF-delimited JSON frame is at most
+8192 bytes. Duplicate keys, unknown READY keys, wrong types, stale binding,
+out-of-order data and mismatched identities refuse authorization.
+
+READY must bind the controller's own TASK_AUDIT_TOKEN and the peer's kernel
+UID/PID/LOCAL_PEERTOKEN to the actual retained application, an equal fresh lookup,
+a live state and the expected executable bytes. The checks repeat before
+AUTHORIZE. LOCAL_PEERTOKEN is dynamic last_pid attribution, **not** an immutable
+connection token or pidfd. Descriptor delegation and reconnect are unsupported.
+The coordinator commits `authorization_intent` to SQLite before dispatch. Lost
+response or cancellation never retries an authorization; existing request-ID
+retrieval/conflict rules and acquisition lease ownership remain intact.
+
+Default app mode passes only `--prepare-session REQUEST`; it sends CANCEL after
+an authenticated READY and cannot request posting. The separate explicit setting
+`BMCP_PEN_ALLOW_AUTHORIZED_EMISSION=1` adds `--allow-authorized-emission`. This is
+configuration for a future reviewed live gate, not current execution authority.
+There is no focus side effect; original425's existing exact-PID FocusBlender
+operation remains the native owner's separate responsibility.
+
+Cancellation uses the authenticated channel, then closes the endpoint. EOF,
+launch callback error, timeout, or launcher state never proves exit. Only the
+retained application's terminated state can do so. A bounded job response keeps
+UNKNOWN and the addon lease when evidence is incomplete; a retained ticket and
+read-only supervisor survive uncertain/late application exit. There is no PID
+signal, SIGKILL, or replacement cleanup contact. Cancelling an MCP await does not
+cancel the already dispatched host worker.
+
+The final parser follows the frozen machine-readable schema
+`software-pen-custody-v1.schema.json`, SHA256
+`1a24c0a2257b0a18f24a361f10ae513127c95229e7aa6ddbee5cf55a2bde7b0b`.
+READY has exactly 12 keys; FINISHED has exactly 18. The outcome spellings are
+`completed`, `cancelled`, `unknown`; booleans do not accept numbers or strings.
+Completed requires authorization consumed, complete evidence, sender release
+observed and null error. Cancelled requires this controller to have sent CANCEL.
+Unknown/incomplete metadata retains the lease even if the app later exits.
+
+Receipt accounting was read from original428 source SHA256
+`1e5b6a97b9dca20f6f4f055907c3564e8d4fb4c62160e598c8734dde1c79b6f4`.
+The exact receipt path must match the request, be an owned regular 0600 file
+without a symlink or additional hard link, and match its raw-byte SHA256. The
+native buffer cap is 4,000,000 bytes / 1211 records, plus one final accounting
+line. The resumed native implementation now caps the complete file, including
+that footer, at 4,000,000 bytes; the controller enforces the same bound.
+Current source checked read-only: `cd07a654353bcc433a0013e47d74468a0ea6213a8d7981f7ee1b95e36d272f6c`. Its footer has exactly
+`log_status`, `evidence_complete`, `buffered_records`, `dropped_records`, `outcome`,
+`sender_release_observed`, `post_calls_observed`. Counts and release observations
+are recomputed from retained records. A complete receipt has a final LF, matching
+counts, no dropped records and consistent outcome. Partial bytes may be retained
+and hashed, but cannot establish complete release.
+
+A valid final frame still cannot establish exit: the controller waits for the
+retained application object, rejects additional frames, and sends no final ACK.
+A complete cancelled PREPARE-only session with no consumed authorization or
+sender posts may release its lease after actual app termination. Authorized work
+also requires returned zero-pressure contact_end and proximity_exit observations.
+These are sender facts, never native release or effect proof.
+
+Parent-owned combined independent review and native validation remain pending.
+The installed approved app is unchanged and does not acquire this protocol merely
+because the adapter source exists. Native receiver delivery, native release,
+geometry effect and art remain UNKNOWN; prior observation420/checkpoint423 results
+and whole-art FAIL are not re-tested or changed by host mocks.

@@ -113,7 +113,16 @@ class PenJobs:
                 result = {'quiescent': True, 'outcome': 'cancelled',
                           'release_attempted': True, 'release': 'not started'}
             else:
-                result = self.backend.run(recipe, directory, cancel)
+                if hasattr(self.backend, 'run_job'):
+                    def persist_intent(binding):
+                        with self.lock:
+                            if job.get('authorization_intent') is not None:
+                                raise ValueError('Authorization already attempted; no replay')
+                            job['authorization_intent'] = binding
+                            self._save(job)
+                    result = self.backend.run_job(job, directory, cancel, persist_intent)
+                else:
+                    result = self.backend.run(recipe, directory, cancel)
             job['backend'] = result
             job['evidence'].update({k: result[k] for k in job['evidence'] if k in result})
             if result.get('quiescent') is True and result.get('release_attempted') is True:
