@@ -898,3 +898,10 @@ This is a third-party integration and not made by Blender. Made by [Siddharth](h
 **If MCP for Blender is useful to you, consider starring the repo**
 
 </div>
+
+### Optional BMCP-1 sculpt and native pen extension
+
+This fork adds guarded sculpt inspection/capture/checkpoints and asynchronous
+coordination of an existing configured QuartzPen executable. The default tool
+surface is unchanged. See [the integration packet](docs/BMCP-1-integration.md)
+for opt-in setup, versioned schemas, evidence boundaries and pending native gates.

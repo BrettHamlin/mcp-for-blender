@@ -1203,6 +1203,216 @@ def _object_detail(obj):
     return detail
 
 
+class SculptControl:
+    """BMCP v1 control plane; called only by the existing main-thread queue."""
+
+    def __init__(self, server):
+        import uuid
+        self.server = server
+        self.instance = str(uuid.uuid4())
+        self.sessions = {}
+        self.lease = None
+
+    @staticmethod
+    def digest(value):
+        import hashlib
+        return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False,
+                                         separators=(',', ':')).encode()).hexdigest()
+
+    def inspect(self):
+        import time
+        obj = bpy.context.active_object
+        if obj is None or obj.type != 'MESH':
+            raise ValueError('An active mesh is required')
+        areas = [a for a in bpy.context.screen.areas if a.type == 'VIEW_3D']
+        if len(areas) != 1:
+            raise ValueError('Exactly one VIEW_3D is required for unambiguous binding')
+        area = areas[0]
+        space = area.spaces.active
+        region = next(r for r in area.regions if r.type == 'WINDOW')
+        view = space.region_3d
+        settings = bpy.context.scene.tool_settings
+        brush = settings.sculpt.brush
+        unified = settings.unified_paint_settings
+        def fields(value, names):
+            return {n: getattr(value, n) for n in names if value is not None and hasattr(value, n)}
+        configured = {
+            'brush': fields(brush, ('name', 'size', 'strength', 'use_pressure_size',
+                'use_pressure_strength', 'sculpt_tool', 'direction', 'spacing',
+                'use_space', 'use_airbrush', 'use_locked_size')),
+            'unified': fields(unified, ('size', 'strength', 'use_unified_size',
+                'use_unified_strength', 'use_locked_size')),
+            'sculpt': fields(settings.sculpt, ('detail_size', 'detail_percent',
+                'constant_detail_resolution', 'detail_refine_method', 'detail_type_method',
+                'use_symmetry_x', 'use_symmetry_y', 'use_symmetry_z')),
+            'dyntopo': obj.use_dynamic_topology_sculpting,
+        }
+        # Scene-space radius is configured input, not a viewport-derived readback.
+        for label, value in (('brush', brush), ('unified', unified)):
+            if value is not None and getattr(value, 'use_locked_size', 'VIEW') == 'SCENE':
+                configured[label]['unprojected_radius'] = value.unprojected_radius
+        # RNA mesh readback is deliberately not synchronized by toggling sculpt mode.
+        geometry = {'vertices': [list(v.co) for v in obj.data.vertices],
+                    'polygons': [list(p.vertices) for p in obj.data.polygons]}
+        identity = {'instance': self.instance, 'pid': os.getpid(),
+            'file': bpy.data.filepath, 'scene': bpy.context.scene.name,
+            'scene_pointer': str(bpy.context.scene.as_pointer()),
+            'object': obj.name, 'object_pointer': str(obj.as_pointer()),
+            'mesh_pointer': str(obj.data.as_pointer()), 'mode': obj.mode,
+            'window_pointer': str(bpy.context.window.as_pointer()),
+            'window_geometry_raw': [bpy.context.window.x, bpy.context.window.y,
+                                    bpy.context.window.width, bpy.context.window.height],
+            'area_pointer': str(area.as_pointer()),
+            'region': [region.x, region.y, region.width, region.height],
+            'view_matrix': [list(row) for row in view.view_matrix],
+            'window_matrix': [list(row) for row in view.window_matrix],
+            'object_matrix': [list(row) for row in obj.matrix_world]}
+        strict = {'identity': identity, 'configured': configured,
+                  'mesh_rna_sha256': self.digest(geometry)}
+        return {'schema': 'bmcp-state/v1', **strict, 'binding': self.digest(strict),
+            'timestamp': time.time(),
+            'geometry_coverage': 'RNA mesh; live sculpt synchronization unverified',
+            'derived_radius_readbacks': {
+                'brush': fields(brush, ('unprojected_radius',)),
+                'unified': fields(unified, ('unprojected_radius',))}}
+
+    def session(self, token):
+        session = self.sessions.get(token)
+        if session is None:
+            raise ValueError('Unknown session; inspect and bind explicitly')
+        state = self.inspect()
+        for key in ('instance', 'pid', 'file', 'scene_pointer', 'object_pointer',
+                    'mesh_pointer', 'window_pointer', 'area_pointer'):
+            if state['identity'][key] != session['identity'][key]:
+                raise ValueError('Stale session identity: ' + key)
+        return session, state
+
+    def path(self, session, name, suffix):
+        from pathlib import Path
+        if not isinstance(name, str) or not name or Path(name).name != name or not name.endswith(suffix):
+            raise ValueError('Artifact name must be a basename ending in ' + suffix)
+        root = Path(session['root'])
+        path = root / name
+        if path.is_symlink() or path.resolve().parent != root:
+            raise ValueError('Artifact escapes session directory')
+        return path
+
+    def dispatch(self, action, params):
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError('BMCP control requires the Blender main thread')
+        if getattr(self.server, 'host', 'localhost') not in ('localhost', '127.0.0.1', '::1'):
+            raise ValueError('BMCP control requires a loopback listener')
+        import uuid
+        import hashlib
+        from pathlib import Path
+        if action == 'inspect':
+            if params:
+                raise ValueError('inspect takes no parameters')
+            return self.inspect()
+        if action == 'bind':
+            if self.lease:
+                raise ValueError('Pen lease active')
+            if set(params) != {'expected_binding'}:
+                raise ValueError('bind requires expected_binding')
+            state = self.inspect()
+            if state['binding'] != params['expected_binding']:
+                raise ValueError('Stale state binding')
+            if not state['identity']['file']:
+                raise ValueError('Save the disposable scene before binding')
+            configured_root = os.environ.get('BMCP_ARTIFACT_ROOT')
+            if not configured_root:
+                raise ValueError('BMCP_ARTIFACT_ROOT must be configured before starting Blender')
+            root = Path(configured_root)
+            if not root.is_absolute() or not root.is_dir() or root.is_symlink():
+                raise ValueError('Artifact root must be an existing absolute directory')
+            token = str(uuid.uuid4())
+            directory = root.resolve() / token
+            directory.mkdir(mode=0o700)
+            self.sessions[token] = {'identity': state['identity'], 'root': str(directory),
+                                    'checkpoints': {}}
+            return {'schema': 'bmcp-session/v1', 'session': token,
+                    'artifact_directory': str(directory), 'state': state}
+        token = params.get('session')
+        session, before = self.session(token)
+        if action == 'release':
+            if set(params) != {'session', 'request_id'}:
+                raise ValueError('release requires session and request_id')
+            if self.lease is not None and self.lease != (token, params['request_id']):
+                raise ValueError('Lease owner mismatch')
+            self.lease = None
+            return {'released': True, 'state': before}
+        if self.lease:
+            raise ValueError('Pen lease active; only inspect/release are allowed')
+        if params.get('expected_binding') != before['binding']:
+            raise ValueError('Stale state binding')
+        common = {'session', 'expected_binding'}
+        extra = {'acquire': {'request_id'}, 'capture': {'name'}, 'save': {'name'},
+                 'restore': {'name', 'discard_current'}, 'configure': {'settings'}}
+        if action not in extra or set(params) != common | extra[action]:
+            raise ValueError('Unknown action or malformed parameters')
+        if action == 'acquire':
+            if before['identity'].get('mode') != 'SCULPT':
+                raise ValueError('Pen execution requires SCULPT mode')
+            if not isinstance(params['request_id'], str) or not params['request_id']:
+                raise ValueError('request_id required')
+            self.lease = (token, params['request_id'])
+            return {'acquired': True, 'state': before}
+        if action == 'configure':
+            changes = params['settings']
+            allowed = {'size', 'strength', 'use_pressure_size', 'use_pressure_strength'}
+            if not isinstance(changes, dict) or not changes or set(changes) - allowed:
+                raise ValueError('Unsupported brush setting')
+            for key, value in changes.items():
+                if key.startswith('use_'):
+                    valid = type(value) is bool
+                elif key == 'size':
+                    valid = type(value) is int and 1 <= value <= 5000
+                else:
+                    valid = type(value) in (int, float) and 0 <= value <= 1
+                if not valid:
+                    raise ValueError('Invalid brush setting: ' + key)
+            brush = bpy.context.scene.tool_settings.sculpt.brush
+            if brush is None:
+                raise ValueError('No active brush')
+            for key, value in changes.items():
+                setattr(brush, key, value)
+            return {'state': self.inspect()}
+        path = self.path(session, params['name'], '.png' if action == 'capture' else '.blend')
+        if action in ('capture', 'save') and path.exists():
+            raise ValueError('Refusing artifact overwrite')
+        if action == 'capture':
+            result = self.server.get_viewport_screenshot(max_size=4096, filepath=str(path))
+            if result.get('error') or result.get('success') is not True:
+                raise RuntimeError('Capture failed: ' + str(result))
+            after = self.inspect()
+            return {'schema': 'bmcp-capture/v1', 'capture': result,
+                'coverage': 'viewport only; not full OS window',
+                'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                'before': before, 'after': after,
+                'strict_state_preserved': before['binding'] == after['binding']}
+        if action == 'save':
+            outcome = bpy.ops.wm.save_as_mainfile(filepath=str(path), copy=True, check_existing=False)
+            if 'FINISHED' not in outcome or not path.is_file():
+                raise RuntimeError('Checkpoint save failed')
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            session['checkpoints'][params['name']] = digest
+            return {'schema': 'bmcp-checkpoint/v1', 'path': str(path), 'sha256': digest,
+                    'state': self.inspect()}
+        if params['discard_current'] is not True:
+            raise ValueError('Restore requires explicit discard_current=true for the bound scene')
+        digest = session['checkpoints'].get(params['name'])
+        if not digest or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ValueError('Checkpoint missing, changed, or not owned by this session')
+        # Opening invalidates all object/window pointers. No automatic rebind or replay.
+        self.sessions.clear()
+        outcome = bpy.ops.wm.open_mainfile(filepath=str(path))
+        if 'FINISHED' not in outcome:
+            raise RuntimeError('Checkpoint reopen failed; inspect before recovery')
+        return {'reopened': str(path), 'sessions_invalidated': True,
+                'acceptance': 'UNKNOWN until fresh inspection and native review'}
+
+
 class BlenderMCPServer:
     def __init__(self, host='localhost', port=9876):
         self.host = host
@@ -1523,6 +1733,16 @@ class BlenderMCPServer:
         """Internal command execution with proper context"""
         cmd_type = command.get("type")
         params = command.get("params", {})
+
+        control = getattr(self, "_sculpt_control", None)
+        if cmd_type == "bmcp_control":
+            if control is None:
+                control = self._sculpt_control = SculptControl(self)
+            if set(params) != {"action", "params"} or not isinstance(params["params"], dict):
+                raise ValueError("Malformed bmcp_control envelope")
+            return {"status": "success", "result": control.dispatch(params["action"], params["params"])}
+        if control is not None and control.lease and cmd_type != "ping":
+            raise ValueError("Pen lease active; upstream commands are temporarily blocked")
 
         # Trivial liveness check. Touches no bpy data, so a successful ping
         # alongside a failing command isolates data access from transport.

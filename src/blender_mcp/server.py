@@ -2270,5 +2270,10 @@ def main():
     context_log.install(mcp, SERVER_INSTRUCTIONS)
     mcp.run()
 
+from .sculpt_tools import register as register_sculpt_tools
+if os.environ.get("BMCP_ENABLE_CONTROL") == "1":
+    register_sculpt_tools(mcp, get_blender_connection)
+
+
 if __name__ == "__main__":
     main()
