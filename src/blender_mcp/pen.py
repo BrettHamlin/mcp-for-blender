@@ -59,6 +59,13 @@ class Stroke(Contract):
         return self
 
 
+class EmissionDeadlines(Contract):
+    """Original absolute authority; never renewed by queue or launch delays."""
+    model_config = ConfigDict(extra='forbid', allow_inf_nan=False, frozen=True)
+    fixture_posting_cutoff_mach_seconds: Number = Field(gt=0)
+    assignment_expires_unix: Number = Field(gt=0)
+
+
 class Recipe(Contract):
     schema_version: Literal['bmcp-pen/v1'] = Field(alias='schema')
     session: str = Field(min_length=1, max_length=128)
@@ -66,6 +73,7 @@ class Recipe(Contract):
     target_pid: StrictInt = Field(gt=0)
     bounds: tuple[Number, Number, Number, Number]
     stroke: Stroke
+    emission_deadlines: EmissionDeadlines | None = None
 
     @model_validator(mode='after')
     def containment(self):
@@ -87,7 +95,7 @@ def recipe_hash(recipe):
 
 
 def preview(payload):
-    recipe = Recipe.model_validate(payload).model_dump(mode='json', by_alias=True)
+    recipe = Recipe.model_validate(payload).model_dump(mode='json', by_alias=True, exclude_none=True)
     return {'schema': 'bmcp-preview/v1', 'recipe': recipe, 'recipe_hash': recipe_hash(recipe),
             'contacts': 1, 'coordinate_frame': FRAME,
             'native_validation': 'UNKNOWN: displays, foreground, permissions checked by emitter',
@@ -110,6 +118,8 @@ class QuartzBackend:
             raise ValueError('Configured QuartzPen is not executable')
 
     def run(self, recipe, directory, cancel):
+        if recipe.get('emission_deadlines') is not None:
+            raise ValueError('Bound recipes require the v2 application backend')
         self.validate()
         if cancel.is_set():
             return {'quiescent': True, 'outcome': 'cancelled', 'release': 'not started', 'release_attempted': True}

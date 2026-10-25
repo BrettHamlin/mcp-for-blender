@@ -75,12 +75,12 @@ def register(mcp, connection):
 
     @mcp.tool()
     async def pen_preview(recipe: Recipe) -> dict:
-        """Validate one sampled contact without input; returns canonical recipe/hash. No native preflight."""
+        """Validate one sampled contact without input; returns canonical recipe/hash including optional immutable emission_deadlines. No native preflight."""
         return await asyncio.to_thread(preview, recipe.model_dump(mode='json', by_alias=True))
 
     @mcp.tool()
     async def pen_execute(request_id: str, recipe: Recipe, expected_recipe_hash: str) -> dict:
-        """Dispatch one hash-bound contact asynchronously. Same ID/payload returns existing job, never replays."""
+        """Dispatch one hash-bound contact asynchronously. Bound emission_deadlines require custody v2. Same ID/payload returns existing job, never replays."""
         main_loop = asyncio.get_running_loop()
         return await asyncio.to_thread(lambda: jobs(main_loop).execute(request_id, recipe.model_dump(mode='json', by_alias=True), expected_recipe_hash))
 

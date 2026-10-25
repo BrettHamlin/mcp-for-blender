@@ -12,6 +12,7 @@ import time
 import uuid
 
 from .pen import canonical, preview
+from .pen_deadlines import DeadlineExpired, EmissionAuthority
 
 
 class PenJobs:
@@ -73,14 +74,27 @@ class PenJobs:
                 other = json.loads(data)
                 if other['lease_held']:
                     raise ValueError('A live or unresolved pen job owns this coordinator')
-            self.backend.validate()
+            authority = EmissionAuthority(recipe)
+            if authority.deadlines is not None and getattr(self.backend, 'supports_emission_deadlines', False) is not True:
+                raise ValueError('Bound recipes require the v2 application backend')
+            admission_error = None
+            try:
+                authority.check()
+            except DeadlineExpired as error:
+                admission_error = str(error)
+            if admission_error is None:
+                self.backend.validate()
             job = {'schema': 'bmcp-job/v1', 'request_id': request_id,
                    'acquisition_id': str(uuid.uuid4()),
                    'recipe': recipe, 'recipe_hash': prepared['recipe_hash'],
                    'state': 'pending', 'lease_held': True,
                    'evidence': {key: 'UNKNOWN' for key in ('posted', 'received', 'applied', 'form_achieved', 'release')}}
             # Persist BEFORE any remote mutation. A lost acquire response is UNKNOWN.
+            if admission_error:
+                job.update(state='refused', lease_held=False, error=admission_error)
             self._save(job)
+            if admission_error:
+                return copy.deepcopy(job)
             cancel = self.cancels[request_id] = threading.Event()
             thread = self.threads[request_id] = threading.Thread(target=self._run, args=(request_id, cancel), daemon=True)
             thread.start()
@@ -89,19 +103,34 @@ class PenJobs:
     def _run(self, request_id, cancel):
         job = self.status(request_id)
         recipe = job['recipe']
+        authority = EmissionAuthority(recipe)
         try:
+            try:
+                authority.check()
+            except DeadlineExpired as error:
+                job.update(state='refused', lease_held=False, error=str(error))
+                with self.lock:
+                    self._save(job)
+                return
             acquired = self.control('acquire', {'session': recipe['session'],
                 'expected_binding': recipe['expected_binding'], 'request_id': request_id,
                     'acquisition_id': job['acquisition_id']})
             if acquired.get('acquired') is not True:
                 raise RuntimeError('Missing lease acknowledgement')
+            refusal = None
+            try:
+                authority.check()
+            except DeadlineExpired as error:
+                refusal = str(error)
             if acquired['state']['identity']['pid'] != recipe['target_pid']:
+                refusal = 'Wrong target PID'
+            if refusal:
                 released = self.control('release', {'session': recipe['session'], 'request_id': request_id,
                     'acquisition_id': job['acquisition_id']})
                 if released.get('released') is not True:
                     raise RuntimeError('Missing lease release acknowledgement')
                 with self.lock:
-                    job.update(state='refused', lease_held=False, error='Wrong target PID')
+                    job.update(state='refused', lease_held=False, error=refusal)
                     self._save(job)
                 return
             with self.lock:
@@ -116,6 +145,7 @@ class PenJobs:
                 if hasattr(self.backend, 'run_job'):
                     def persist_intent(binding):
                         with self.lock:
+                            authority.check()
                             if job.get('authorization_intent') is not None:
                                 raise ValueError('Authorization already attempted; no replay')
                             job['authorization_intent'] = binding

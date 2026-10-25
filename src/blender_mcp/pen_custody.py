@@ -16,6 +16,7 @@ import time
 import uuid
 
 from .pen import canonical, recipe_hash
+from .pen_deadlines import DeadlineExpired, EmissionAuthority
 from .pen_app import DarwinApplications, LaunchTicket, launch_diagnostic
 
 SCHEMA = 'software-pen-custody/v1'
@@ -95,8 +96,11 @@ class Channel:
         self.deadline = deadline
         self.cancel = cancel
         self.buffer = bytearray()
+        self.emission_authority = None
 
     def check(self):
+        if self.emission_authority is not None:
+            self.emission_authority.check()
         if self.cancel.is_set():
             raise Cancelled('Cancellation requested')
         if time.monotonic() >= self.deadline:
@@ -131,11 +135,15 @@ class Channel:
         data = memoryview((canonical(dict(self.binding, kind=kind)) + '\n').encode())
         deadline = min(self.deadline, time.monotonic() + .2) if not cleanup else time.monotonic() + .2
         while data:
+            if kind == 'authorize' and self.emission_authority is not None:
+                self.emission_authority.check()
             if not cleanup:
                 self.check()
             if time.monotonic() >= deadline:
                 raise TimeoutError('Custody send deadline')
             if select.select([], [self.connection], [], .02)[1]:
+                if kind == 'authorize' and self.emission_authority is not None:
+                    self.emission_authority.check()
                 count = self.connection.send(data)
                 if not count:
                     raise EOFError('Custody disconnected')
@@ -242,6 +250,8 @@ def verify_finished(frame, binding, ready, receipt_path, authorization_sent, can
 
 class AppQuartzBackend:
     """Retained application owners survive metadata failure and cancelled MCP awaits."""
+    supports_emission_deadlines = True
+
     def __init__(self, app_path, executable, sha256, *, allow_emission=False, applications=None, main_loop=None):
         self.app_path = Path(app_path)
         self.executable = Path(executable)
@@ -316,13 +326,19 @@ class AppQuartzBackend:
                 return  # Keep the failed/ambiguous ticket for external reconciliation.
 
     def run_job(self, job, directory, cancel, persist_intent):
-        self.validate()
         acquisition = job['acquisition_id']
         if str(uuid.UUID(acquisition)) != acquisition or acquisition in self.owners:
             raise ValueError('Invalid or reused acquisition')
         recipe = job['recipe']
         if recipe_hash(recipe) != job['recipe_hash']:
             raise ValueError('Recipe binding changed')
+        authority = EmissionAuthority(recipe)
+        try:
+            authority.check()
+        except DeadlineExpired as error:
+            return {'quiescent': True, 'outcome': 'UNKNOWN', 'release': 'not started',
+                    'release_attempted': True, 'error': str(error)}
+        self.validate()
         directory = private_directory(directory)
         stroke = canonical(recipe['stroke']).encode()
         if len(stroke) > 2_000_000:
@@ -335,6 +351,7 @@ class AppQuartzBackend:
         connection = channel = ticket = None
         authenticated = False
         authorization_sent = cancel_sent = False
+        launch_requested = authorization_attempted = deadline_expired = False
         result = {'quiescent': False, 'outcome': 'UNKNOWN', 'release': 'UNKNOWN',
                   'release_attempted': False, 'posted': 'UNKNOWN'}
         started = time.monotonic()
@@ -352,6 +369,8 @@ class AppQuartzBackend:
                 socket_path=str(socket_path), controller_pid=os.getpid(), controller_audit_token=controller_token,
                 prepare_timeout_seconds=self.prepare_seconds, session_timeout_seconds=self.session_seconds,
                 receipt_path=str(directory / 'receipt.jsonl'))
+            if authority.deadlines is not None:
+                request.update(schema='software-pen-custody/v2', **authority.deadlines.model_dump())
             request_bytes = canonical(request).encode()
             request_path = directory / 'request.json'
             persist(request_path, request_bytes)
@@ -359,16 +378,20 @@ class AppQuartzBackend:
             binding['request_sha256'] = digest(request_bytes)
             if cancel.is_set():
                 return dict(result, quiescent=True, outcome='cancelled', release_attempted=True, release='not started')
+            authority.check()
             ticket = self.owners[acquisition] = LaunchTicket()
             arguments = ['--prepare-session', str(request_path)]
             if self.allow_emission:
                 arguments.append('--allow-authorized-emission')
             launch_diagnostic('launch_requested', ticket=id(ticket), started=started,
                               prepare_deadline=min(deadline, started + self.prepare_seconds))
+            authority.check()
+            launch_requested = True
             self.applications.launch(ticket, self.app_path, arguments)
             prepare_deadline = min(deadline, started + self.prepare_seconds)
             launch_diagnostic('ticket_wait_enter', ticket=id(ticket), prepare_deadline=prepare_deadline)
             while not ticket.completed.is_set():
+                authority.check()
                 self.applications.refresh()
                 if cancel.is_set() or time.monotonic() >= prepare_deadline:
                     launch_diagnostic('ticket_wait_rejected', ticket=id(ticket),
@@ -383,6 +406,7 @@ class AppQuartzBackend:
             persist(directory / 'application.json', canonical({'pid': self.applications.pid(app),
                 'acquisition_id': acquisition, 'executable': str(self.executable), 'sha256': self.sha256}).encode())
             while connection is None:
+                authority.check()
                 if cancel.is_set() or time.monotonic() >= prepare_deadline:
                     raise TimeoutError('READY connection missing or cancelled')
                 if select.select([listener], [], [], .02)[0]:
@@ -390,12 +414,14 @@ class AppQuartzBackend:
                     launch_diagnostic('connection_accepted', ticket=id(ticket))
             listener.close()  # Exactly one connection; no reconnect.
             channel = Channel(connection, binding, prepare_deadline, cancel)
+            channel.emission_authority = authority
             launch_diagnostic('ready_read_enter', ticket=id(ticket))
             ready = channel.read()
             launch_diagnostic('ready_read_return', ticket=id(ticket))
             verify_ready(ready, binding, controller_token, self.allow_emission)
             self.authenticate(app, connection, ready)
             authenticated = True
+            authority.check()
             channel.deadline = deadline
             if not self.allow_emission:
                 channel.write_frame('cancel', cleanup=True)
@@ -403,11 +429,15 @@ class AppQuartzBackend:
                 channel.cancel = threading.Event()
             else:
                 channel.require_idle()
+                authority.check()
                 persist_intent(binding)  # Durable before dispatch, never retried.
                 self.authenticate(app, connection, ready)
                 channel.require_idle()
+                authority.check()
+                authorization_attempted = True
                 channel.write_frame('authorize')
                 authorization_sent = True
+            channel.emission_authority = None  # FINISHED and cleanup retain their original budgets.
             try:
                 frame = channel.read()
             except Cancelled:
@@ -420,15 +450,22 @@ class AppQuartzBackend:
             verify_finished(frame, binding, ready, directory / 'receipt.jsonl', authorization_sent, cancel_sent)
             result['finished'] = frame
             result['quiescent'] = self._observe_exit(ticket, time.monotonic() + self.cleanup_seconds, channel)
-            if result['quiescent'] and frame['evidence_complete'] and frame['outcome'] in ('completed', 'cancelled'):
+            deadline_refusal = frame['outcome'] == 'unknown' and frame['error'] in (
+                'fixture posting cutoff expired', 'original assignment expired')
+            if result['quiescent'] and frame['evidence_complete'] and (frame['outcome'] in ('completed', 'cancelled') or deadline_refusal):
                 released = frame['sender_release_observed'] or (not frame['authorized'] and frame['post_calls_observed'] == 0)
                 if released:
-                    result.update(outcome=frame['outcome'], release_attempted=True,
+                    result.update(outcome='UNKNOWN' if deadline_refusal else frame['outcome'], release_attempted=True,
                         release='emitter up/exit observed; native release UNKNOWN' if frame['sender_release_observed'] else 'not authorized; no sender posts reported',
                         post_calls_observed=frame['post_calls_observed'],
                         posted='observed; coverage unverified' if frame['post_calls_observed'] else 'UNKNOWN')
         except Exception as exc:
             result['error'] = str(exc)
+            deadline_expired = isinstance(exc, DeadlineExpired)
+            if not launch_requested:
+                self.owners.pop(acquisition, None)
+                ticket = None
+                result.update(quiescent=True, release_attempted=True, release='not started')
             if channel is not None and authenticated:
                 try:
                     self.authenticate(ticket.application, connection, ready)
@@ -437,17 +474,21 @@ class AppQuartzBackend:
                     pass
         finally:
             # Endpoint cleanup cannot bypass lifetime custody if it fails.
+            endpoint_cleanup_failed = False
             for cleanup in (lambda: connection.close() if connection is not None else None,
                             listener.close, lambda: (socket_dir / 's').unlink(missing_ok=True),
                             socket_dir.rmdir):
                 try:
                     cleanup()
                 except Exception as exc:
+                    endpoint_cleanup_failed = True
                     result.update(error=result.get('error') or str(exc), outcome='UNKNOWN', release_attempted=False)
             if ticket is not None:
                 if not result['quiescent']:
                     result['quiescent'] = self._observe_exit(ticket, time.monotonic() + self.cleanup_seconds)
                 if result['quiescent']:
+                    if deadline_expired and not authorization_attempted and not endpoint_cleanup_failed:
+                        result.update(release_attempted=True, release='not authorized')
                     self.owners.pop(acquisition, None)
                 else:
                     threading.Thread(target=self._retain_until_exit, args=(acquisition, ticket), daemon=True).start()
