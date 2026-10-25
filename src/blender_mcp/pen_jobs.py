@@ -9,6 +9,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 
 from .pen import canonical, preview
 
@@ -74,6 +75,7 @@ class PenJobs:
                     raise ValueError('A live or unresolved pen job owns this coordinator')
             self.backend.validate()
             job = {'schema': 'bmcp-job/v1', 'request_id': request_id,
+                   'acquisition_id': str(uuid.uuid4()),
                    'recipe': recipe, 'recipe_hash': prepared['recipe_hash'],
                    'state': 'pending', 'lease_held': True,
                    'evidence': {key: 'UNKNOWN' for key in ('posted', 'received', 'applied', 'form_achieved', 'release')}}
@@ -89,11 +91,13 @@ class PenJobs:
         recipe = job['recipe']
         try:
             acquired = self.control('acquire', {'session': recipe['session'],
-                'expected_binding': recipe['expected_binding'], 'request_id': request_id})
+                'expected_binding': recipe['expected_binding'], 'request_id': request_id,
+                    'acquisition_id': job['acquisition_id']})
             if acquired.get('acquired') is not True:
                 raise RuntimeError('Missing lease acknowledgement')
             if acquired['state']['identity']['pid'] != recipe['target_pid']:
-                released = self.control('release', {'session': recipe['session'], 'request_id': request_id})
+                released = self.control('release', {'session': recipe['session'], 'request_id': request_id,
+                    'acquisition_id': job['acquisition_id']})
                 if released.get('released') is not True:
                     raise RuntimeError('Missing lease release acknowledgement')
                 with self.lock:
@@ -113,7 +117,8 @@ class PenJobs:
             job['backend'] = result
             job['evidence'].update({k: result[k] for k in job['evidence'] if k in result})
             if result.get('quiescent') is True and result.get('release_attempted') is True:
-                released = self.control('release', {'session': recipe['session'], 'request_id': request_id})
+                released = self.control('release', {'session': recipe['session'], 'request_id': request_id,
+                    'acquisition_id': job['acquisition_id']})
                 if released.get('released') is not True:
                     raise RuntimeError('Missing lease release acknowledgement')
                 job['after'] = released.get('state')
@@ -148,9 +153,17 @@ class PenJobs:
                 return job
             if native_release_verified is not True or not isinstance(note, str) or not note.strip():
                 raise ValueError('External process-exit and native-release verification note required')
-            response = self.control('release', {'session': job['recipe']['session'], 'request_id': request_id})
-            if response.get('released') is not True:
-                raise ValueError('Lease release not acknowledged')
+            acquisition_id = job.get('acquisition_id')
+            if not acquisition_id:
+                raise ValueError('Legacy job has no acquisition identity; ownership UNKNOWN')
+        # Socket waits must not hold the status/cancellation lock. The persisted
+        # unresolved lease still prevents execute from admitting another writer.
+        response = self.control('release', {'session': job['recipe']['session'],
+            'request_id': request_id, 'acquisition_id': acquisition_id})
+        if response.get('released') is not True:
+            raise ValueError('Lease release not acknowledged')
+        with self.lock:
+            job = self.status(request_id)
             job.update(lease_held=False, reconciliation={'external_claim': note,
                 'native_release_verified_by_caller': True})
             self._save(job)

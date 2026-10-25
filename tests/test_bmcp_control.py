@@ -92,12 +92,12 @@ def test_checkpoint_save_restore_integrity_and_explicit_discard(setup):
 
 def test_lease_blocks_mutations_and_wrong_owner_release(setup):
     control, _, _, _, params, _ = setup
-    control.dispatch('acquire', {**params, 'request_id': 'one'})
+    control.dispatch('acquire', {**params, 'request_id': 'one', 'acquisition_id': '11111111-1111-4111-8111-111111111111'})
     with pytest.raises(ValueError, match='lease active'):
         control.dispatch('save', {**params, 'name': 'copy.blend'})
     with pytest.raises(ValueError, match='owner mismatch'):
-        control.dispatch('release', {'session': params['session'], 'request_id': 'two'})
-    control.dispatch('release', {'session': params['session'], 'request_id': 'one'})
+        control.dispatch('release', {'session': params['session'], 'request_id': 'two', 'acquisition_id': '22222222-2222-4222-8222-222222222222'})
+    control.dispatch('release', {'session': params['session'], 'request_id': 'one', 'acquisition_id': '11111111-1111-4111-8111-111111111111'})
     assert control.lease is None
 
 
@@ -140,7 +140,7 @@ def test_non_sculpt_contact_and_extra_parameters_refused(setup):
     control, _, _, state, params, _ = setup
     state['identity']['mode'] = 'OBJECT'
     with pytest.raises(ValueError, match='SCULPT'):
-        control.dispatch('acquire', {**params, 'request_id': 'one'})
+        control.dispatch('acquire', {**params, 'request_id': 'one', 'acquisition_id': '11111111-1111-4111-8111-111111111111'})
     with pytest.raises(ValueError, match='malformed'):
         control.dispatch('save', {**params, 'name': 'a.blend', 'overwrite': True})
 
@@ -161,3 +161,21 @@ def test_dispatch_enforces_main_thread_and_loopback(setup):
     server.host = '0.0.0.0'
     with pytest.raises(ValueError, match='loopback'):
         control.dispatch('inspect', {})
+
+
+def test_acquisition_duplicate_retirement_and_unknown_release(setup):
+    control, _, _, _, params, _ = setup
+    owner = dict(session=params['session'], request_id='one',
+                 acquisition_id='11111111-1111-4111-8111-111111111111')
+    acquire = dict(**owner, expected_binding=params['expected_binding'])
+    assert control.dispatch('acquire', acquire)['acquired']
+    lease = control.lease
+    assert control.dispatch('acquire', acquire)['acquired'] and control.lease == lease
+    control.dispatch('release', owner)
+    assert control.dispatch('release', owner)['released']
+    with pytest.raises(ValueError, match='no replay'):
+        control.dispatch('acquire', acquire)
+    with pytest.raises(ValueError, match='owner mismatch'):
+        control.dispatch('release', {**owner, 'acquisition_id': '22222222-2222-4222-8222-222222222222'})
+    with pytest.raises(ValueError, match='identity'):
+        control.dispatch('release', dict(session=params['session'], request_id='one'))

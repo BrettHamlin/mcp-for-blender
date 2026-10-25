@@ -1212,6 +1212,7 @@ class SculptControl:
         self.instance = str(uuid.uuid4())
         self.sessions = {}
         self.lease = None
+        self.released_acquisitions = set()
 
     @staticmethod
     def digest(value):
@@ -1335,28 +1336,43 @@ class SculptControl:
                     'artifact_directory': str(directory), 'state': state}
         token = params.get('session')
         session, before = self.session(token)
-        if action == 'release':
-            if set(params) != {'session', 'request_id'}:
-                raise ValueError('release requires session and request_id')
-            if self.lease is not None and self.lease != (token, params['request_id']):
-                raise ValueError('Lease owner mismatch')
-            self.lease = None
-            return {'released': True, 'state': before}
+        if action in ('acquire', 'release'):
+            required = {'session', 'request_id', 'acquisition_id'}
+            if action == 'acquire':
+                required.add('expected_binding')
+            if set(params) != required:
+                raise ValueError('Lease operation requires exact acquisition identity parameters')
+            acquisition = params['acquisition_id']
+            if not isinstance(acquisition, str) or str(uuid.UUID(acquisition)) != acquisition:
+                raise ValueError('Canonical acquisition UUID required')
+            if not isinstance(params['request_id'], str) or not params['request_id']:
+                raise ValueError('request_id required')
+            owner = (token, params['request_id'], acquisition)
+            if action == 'release':
+                if owner in self.released_acquisitions:
+                    return {'released': True, 'state': before}
+                if self.lease != owner:
+                    raise ValueError('Lease owner mismatch')
+                self.released_acquisitions.add(owner)
+                self.lease = None
+                return {'released': True, 'state': before}
+            if owner in self.released_acquisitions:
+                raise ValueError('Acquisition already released; no replay')
+            if self.lease == owner:
+                return {'acquired': True, 'state': before}
         if self.lease:
             raise ValueError('Pen lease active; only inspect/release are allowed')
         if params.get('expected_binding') != before['binding']:
             raise ValueError('Stale state binding')
         common = {'session', 'expected_binding'}
-        extra = {'acquire': {'request_id'}, 'capture': {'name'}, 'save': {'name'},
+        extra = {'acquire': {'request_id', 'acquisition_id'}, 'capture': {'name'}, 'save': {'name'},
                  'restore': {'name', 'discard_current'}, 'configure': {'settings'}}
         if action not in extra or set(params) != common | extra[action]:
             raise ValueError('Unknown action or malformed parameters')
         if action == 'acquire':
             if before['identity'].get('mode') != 'SCULPT':
                 raise ValueError('Pen execution requires SCULPT mode')
-            if not isinstance(params['request_id'], str) or not params['request_id']:
-                raise ValueError('request_id required')
-            self.lease = (token, params['request_id'])
+            self.lease = owner
             return {'acquired': True, 'state': before}
         if action == 'configure':
             changes = params['settings']

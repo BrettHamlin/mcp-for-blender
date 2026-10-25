@@ -24,16 +24,54 @@ isolated environment only.
 - Extension dispatch now explicitly refuses a non-main thread or non-loopback
   listener. This does not secure upstream raw socket execution or prove a crash fix.
 
+## Independent review repair round
+
+All four reported findings are addressed in this implementation round. This is
+an implementation response, not the next independent review or native acceptance.
+The supplied `/tmp/bmcp_independent_repro.py` was read. New regression tests were
+run before fixes: 14 failed and 6 passed, reproducing all four finding classes.
+
+1. **Old reconciliation releasing a new lease:** each job now commits a random
+   acquisition UUID to SQLite before dispatch. Acquire/release use the exact
+   session/request/acquisition tuple. The addon remembers retired tuples for its
+   instance lifetime: duplicate release acknowledges only that retired owner and
+   never touches a newer lease; duplicate active acquire acknowledges ownership;
+   retired acquire refuses replay. Two stores using `one` in the same session
+   receive distinct owners. The actual extracted addon/coordinator regression
+   includes a lost release acknowledgement and coordinator reopen. Legacy records
+   lacking a UUID remain unresolved and cannot guess ownership.
+2. **Post-launch metadata failure losing custody:** metadata write exceptions
+   stay within the process supervision loop. They trigger bounded SIGTERM cleanup,
+   polling and evidence parsing. Poll/signal errors and the 20+5 second timeout
+   remain bounded without SIGKILL. Exit alone cannot release the lease. Tests run
+   the actual adapter through the coordinator with a fake Popen and failing
+   `process.json`, both with and without emitter up/exit observations. Error
+   outcomes remain UNKNOWN even when cleanup permits releasing the lease.
+3. **Synchronous MCP wrappers blocking cancellation:** all extension handlers are
+   async and offload blocking host work with `asyncio.to_thread`. Existing socket
+   serialization and the Blender main-thread queue remain intact. Reconciliation
+   releases the coordinator lock before its socket wait, retaining the durable
+   unresolved lease. Public FastMCP tests verify timer progress and status/cancel
+   completion while inspect or reconciliation is blocked.
+4. **Safety boolean coercion:** both `discard_current` and
+   `native_release_verified` use Pydantic StrictBool. Public FastMCP dispatch tests
+   reject 1, 0, strings and null before reaching either handler operation, and
+   check that literal true/false route unchanged.
+
+Additional host cases cover duplicate/retired/unknown owners, legacy records,
+partial startup, external cancellation at launch, signal/poll errors and timeout.
+No process other than isolated host fakes was signalled by the tests.
+
 ## Verification
 
-- 30 extension host tests pass, including public MCP execute -> durable
+- 58 extension host tests pass, including public MCP execute -> durable
   coordinator -> injected external backend, cancellation, exact/conflicting IDs,
   restart without replay, partial/absent evidence, lease ownership, wrong target,
   frame/schema errors, path/hash guards, capture/save errors, explicit restore,
   actual state-hash behavior and configured/derived radius distinction.
 - Wheel build succeeds. Wheel addon and all three new host modules were compared
   byte-for-byte with source. Root and bundled addon are identical.
-- Full final suite: **584 passed, 6 failed, 1 skipped** (30.81 seconds).
+- Full final suite: **612 passed, 6 failed, 1 skipped** (32.26 seconds).
 - Six upstream compatibility failures reproduce against a `git archive` export
   of baseline source using the same isolated interpreter. Every failure is
   `test_addon_status_always_answers`: `No module named 'blender_mcp.config'`.
@@ -42,10 +80,10 @@ isolated environment only.
 - `git diff --check` passes. MIT notices are unchanged.
 
 Addon SHA256:
-`c6364c6f2e311b31b218fe3dbffaadd4ae9ec7b8c88521015d41e85e872f1555`
+`d0aeb7cfdeb8f24b8529b2c40d2d62e3a4390870999be2fd0e6ebb97b4ba82ee`
 
 Local wheel SHA256 (build artifact, not uploaded):
-`ba61761e5ecaf0268d3a2b572d70515a47c517f756748dca5ce1440fb9c258b8`
+`b1b8cdc799abafb470db62341c5189b771886e96f74b829acf14e7a9f8397086`
 
 ## Open boundaries
 

@@ -122,21 +122,35 @@ class QuartzBackend:
         # Files avoid pipe backpressure during release; no shell or mutable helper imports.
         with (directory / 'emitter.jsonl').open('xb') as out, (directory / 'emitter.stderr').open('xb') as err:
             process = subprocess.Popen(argv, stdout=out, stderr=err, start_new_session=True)
-            (directory / 'process.json').write_text(canonical({'pid': process.pid, 'executable': str(self.executable),
-                                                            'sha256': self.sha256}))
+            # Custody begins at Popen, before any fallible metadata persistence.
             started = time.monotonic()
+            error = None
+            try:
+                (directory / 'process.json').write_text(canonical({'pid': process.pid,
+                    'executable': str(self.executable), 'sha256': self.sha256}))
+            except Exception as exc:
+                error = str(exc)
             signalled = None
-            while process.poll() is None:
-                if (cancel.is_set() or time.monotonic() - started > 20) and signalled is None:
-                    process.terminate()  # Existing SIGTERM handler attempts up + proximity exit.
+            while True:
+                try:
+                    if process.poll() is not None:
+                        break
+                except Exception as exc:
+                    error = error or str(exc)
+                if (error or cancel.is_set() or time.monotonic() - started > 20) and signalled is None:
                     signalled = time.monotonic()
+                    try:
+                        process.terminate()  # Existing handler attempts up + proximity exit.
+                    except Exception as exc:
+                        error = error or str(exc)
                 if signalled is not None and time.monotonic() - signalled > 5:
                     return {'quiescent': False, 'outcome': 'UNKNOWN', 'release': 'UNKNOWN',
-                            'reason': 'Emitter did not exit after SIGTERM; lease retained', 'pid': process.pid}
+                            'error': error, 'reason': 'Exit unverified after SIGTERM; lease retained',
+                            'pid': process.pid}
                 time.sleep(0.02)
         evidence = emitter_evidence(directory / 'emitter.jsonl', recipe)
-        return {'quiescent': True, 'exit_code': process.returncode,
-                'outcome': 'cancelled' if cancel.is_set() else 'completed' if process.returncode == 0 else 'UNKNOWN',
+        return {'quiescent': True, 'exit_code': process.returncode, 'error': error,
+                'outcome': 'UNKNOWN' if error else 'cancelled' if cancel.is_set() else 'completed' if process.returncode == 0 else 'UNKNOWN',
                 **evidence}
 
 

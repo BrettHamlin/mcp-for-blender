@@ -43,7 +43,9 @@ profile. Do not enable/start it until the parent approves. Each bound session
 creates a private subdirectory. Capture/save accept basenames only and refuse
 existing artifacts. Restore only opens a session-recorded checkpoint whose bytes
 still match, with explicit `discard_current=true` and the current state binding.
-It invalidates sessions; inspect and bind again. This is not Dyntopo rollback.
+Both safety attestations (`discard_current` and `native_release_verified`) accept
+only literal JSON booleans; numbers, strings and null are rejected at MCP dispatch.
+Restore invalidates sessions; inspect and bind again. This is not Dyntopo rollback.
 
 ## State and capture contract
 
@@ -112,7 +114,27 @@ review, not merely updating the hash. Upstream MIT attribution remains intact.
 ## Jobs, cancellation and evidence
 
 `pen_execute(request_id, recipe, expected_recipe_hash)` durably records the job
-before acquiring the addon lease. It returns promptly; a host worker obtains
+before acquiring the addon lease. The record includes a random UUID
+`acquisition_id`, generated once and committed before dispatch. Request IDs are
+store-local; acquisition UUIDs distinguish owners across stores and restarts.
+Acquire/release require the exact `(session, request_id, acquisition_id)` tuple.
+The addon retains released tuples for its instance lifetime: a duplicate release
+acknowledges the old release without touching a newer owner, an active duplicate
+acquire acknowledges the same owner, and a retired acquire refuses replay.
+Unknown owners refuse release even when no lease is active. Addon restart loses
+sessions and retired tuples and therefore refuses old-session recovery. Legacy
+job records without acquisition identity remain UNKNOWN; reconciliation cannot
+invent an identity for them. Pair package/addon from this revision because the
+lease wire parameters have changed within this draft contract.
+
+All extension MCP handlers are async and offload blocking host calls. The existing
+connection lock still serializes socket requests and Blender dispatch still uses
+its main-thread queue; no bpy operation moves to a host thread. Reconciliation
+waits for the socket outside the coordinator lock, so status/cancel remain
+available during a slow control command. Cancelling an MCP await does not abort
+an already dispatched socket operation or imply native release.
+
+Execution returns promptly; a host worker obtains
 and finishes the short acquire command **before** starting the external process.
 Blender's main thread never waits for the pen. The addon rejects other MCP
 commands while leased (inspect, ping and owned release remain available).
@@ -133,7 +155,14 @@ handle and waits for cleanup; after 20 seconds it also requests SIGTERM, allowin
 five seconds to exit. It never SIGKILLs, signals a recovered PID, or injects an
 extra contact. If the process does not exit, or logs do not show both zero-pressure
 up and proximity exit, the lease stays unresolved. A process exit alone is not
-release evidence. Cancel after a lost process handle reports UNKNOWN.
+release evidence. Process custody begins immediately after Popen: failure to
+persist `process.json` triggers bounded SIGTERM cleanup and polling rather than
+escaping supervision. Such jobs retain an UNKNOWN outcome, even if exit plus
+emitter up/exit observations allow lease release. Poll/termination errors are
+also bounded; unverified exit retains the lease. After the cleanup deadline the
+worker returns UNKNOWN without further signalling; external verification is
+required. Log output goes to files, not pipes, so cleanup does not wait for pipe
+readers or an output-flush operation. Cancel after a lost process handle reports UNKNOWN.
 
 `pen_status` returns durable request/recipe/hash/state, emitter result and separate
 posted/received/applied/form_achieved/release fields. Complete or partial emitter
