@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -10,7 +11,7 @@ import sys
 import time
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, field_validator, model_validator
 
 FRAME = 'quartz-global: origin main-display top-left, x right, y down'
 Number = StrictFloat | StrictInt
@@ -64,6 +65,17 @@ class EmissionDeadlines(Contract):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False, frozen=True)
     fixture_posting_cutoff_mach_seconds: Number = Field(gt=0)
     assignment_expires_unix: Number = Field(gt=0)
+
+    @field_validator('fixture_posting_cutoff_mach_seconds', 'assignment_expires_unix')
+    @classmethod
+    def finite_double(cls, value):
+        try:
+            finite = math.isfinite(float(value))
+        except OverflowError:
+            finite = False
+        if not finite:
+            raise ValueError('Deadline must be representable as a finite Double')
+        return value
 
 
 class Recipe(Contract):

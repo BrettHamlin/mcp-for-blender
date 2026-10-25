@@ -1,6 +1,7 @@
 """451/454 regressions using actual methods and wholly inert transport/app objects."""
 import copy
 import json
+import sys
 import threading
 from types import SimpleNamespace as NS
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from blender_mcp import pen_custody as custody, pen_deadlines as deadlines
-from blender_mcp.pen import EmissionDeadlines, QuartzBackend, canonical, preview
+from blender_mcp.pen import EmissionDeadlines, QuartzBackend, Recipe, canonical, preview, recipe_hash
 from blender_mcp.pen_jobs import PenJobs
 from test_bmcp_pen import recipe, Control, close, wait
 from test_bmcp_custody import Applications, finished_fixture
@@ -45,6 +46,7 @@ def test_immutable_normalization_legacy_hash_and_public_schema(recipe, bound):
     legacy = copy.deepcopy(recipe)
     legacy.pop('emission_deadlines')
     assert preview(legacy)['recipe'] == legacy
+    assert preview(legacy)['recipe_hash'] == recipe_hash(legacy)
     assert preview(bound)['recipe_hash'] != preview(legacy)['recipe_hash']
     from blender_mcp.pen import Recipe
     assert 'emission_deadlines' in Recipe.model_json_schema()['properties']
@@ -378,3 +380,39 @@ def test_expiry_cannot_disguise_reused_application_owner(tmp_path, bound, clock,
     with pytest.raises(ValueError, match='reused acquisition'):
         transport.run(bound)
     assert list(transport.backend.owners.values()) == [owner]
+
+
+@pytest.mark.parametrize('field', ['fixture_posting_cutoff_mach_seconds', 'assignment_expires_unix'])
+@pytest.mark.parametrize('value', [10**400, 10**309, 2**1024, float('inf'), float('-inf'), float('nan')],
+                         ids=['int400', 'int309', 'double-overflow', 'infinity', 'negative-infinity', 'nan'])
+def test_non_double_deadlines_refused_before_acquisition(tmp_path, bound, field, value):
+    bound['emission_deadlines'][field] = value
+    with pytest.raises(ValueError):
+        Recipe.model_validate(bound)  # The typed public preview/execute input.
+    with pytest.raises(ValueError):
+        preview(bound)
+    def forbidden(*args):
+        pytest.fail('Invalid public deadline reached acquisition or backend')
+    backend = NS(supports_emission_deadlines=True, validate=forbidden, run_job=forbidden)
+    jobs = PenJobs(tmp_path, backend, forbidden)
+    try:
+        with pytest.raises(ValueError):
+            jobs.execute('overflow', bound, '0' * 64)
+        assert jobs.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0] == 0
+        assert not jobs.threads
+    finally:
+        close(jobs)
+
+
+@pytest.mark.parametrize('field', ['fixture_posting_cutoff_mach_seconds', 'assignment_expires_unix'])
+@pytest.mark.parametrize('value', [1, 420, 1.25, 420.0, 10**308, int(sys.float_info.max),
+                                   sys.float_info.max, float.fromhex('0x0.0000000000001p-1022')],
+                         ids=['one', 'ordinary-int', 'fraction', 'ordinary-float', 'large-int',
+                              'largest-double-int', 'largest-double', 'smallest-positive-double'])
+def test_finite_double_deadlines_preserve_original_values_and_hash(bound, field, value):
+    bound['emission_deadlines'][field] = value
+    prepared = preview(bound)
+    actual = prepared['recipe']['emission_deadlines'][field]
+    assert type(actual) is type(value) and actual == value
+    assert canonical(prepared['recipe']) == canonical(bound)
+    assert prepared['recipe_hash'] == recipe_hash(bound)
