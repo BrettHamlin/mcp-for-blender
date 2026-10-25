@@ -16,7 +16,7 @@ import time
 import uuid
 
 from .pen import canonical, recipe_hash
-from .pen_app import DarwinApplications, LaunchTicket
+from .pen_app import DarwinApplications, LaunchTicket, launch_diagnostic
 
 SCHEMA = 'software-pen-custody/v1'
 LIMIT = 8192
@@ -363,13 +363,20 @@ class AppQuartzBackend:
             arguments = ['--prepare-session', str(request_path)]
             if self.allow_emission:
                 arguments.append('--allow-authorized-emission')
+            launch_diagnostic('launch_requested', ticket=id(ticket), started=started,
+                              prepare_deadline=min(deadline, started + self.prepare_seconds))
             self.applications.launch(ticket, self.app_path, arguments)
             prepare_deadline = min(deadline, started + self.prepare_seconds)
+            launch_diagnostic('ticket_wait_enter', ticket=id(ticket), prepare_deadline=prepare_deadline)
             while not ticket.completed.is_set():
                 self.applications.refresh()
                 if cancel.is_set() or time.monotonic() >= prepare_deadline:
+                    launch_diagnostic('ticket_wait_rejected', ticket=id(ticket),
+                                      completed=ticket.completed.is_set(), cancelled=cancel.is_set(),
+                                      prepare_deadline=prepare_deadline)
                     raise TimeoutError('Launch completion missing or cancelled')
                 ticket.completed.wait(.02)
+            launch_diagnostic('ticket_wait_return', ticket=id(ticket))
             if ticket.error or ticket.application is None:
                 raise RuntimeError(ticket.error or 'Launch returned no retained application')
             app = ticket.application
@@ -380,9 +387,12 @@ class AppQuartzBackend:
                     raise TimeoutError('READY connection missing or cancelled')
                 if select.select([listener], [], [], .02)[0]:
                     connection, _ = listener.accept()
+                    launch_diagnostic('connection_accepted', ticket=id(ticket))
             listener.close()  # Exactly one connection; no reconnect.
             channel = Channel(connection, binding, prepare_deadline, cancel)
+            launch_diagnostic('ready_read_enter', ticket=id(ticket))
             ready = channel.read()
+            launch_diagnostic('ready_read_return', ticket=id(ticket))
             verify_ready(ready, binding, controller_token, self.allow_emission)
             self.authenticate(app, connection, ready)
             authenticated = True

@@ -1,6 +1,7 @@
 """Inert host controller tests. All application objects and peer identities are fakes."""
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 import socket
@@ -204,13 +205,21 @@ def test_dispatch_never_replays_and_keeps_unknown(setup, scenario):
     assert len(apps.calls) == 1
 
 
-def test_prepare_only_cancels_without_intent(setup):
+def test_prepare_only_cancels_without_intent(setup, caplog):
+    caplog.set_level(logging.DEBUG, logger='blender_mcp.pen_app.launch')
     backend, apps, job, directory = setup(enabled=False)
     intents = []
     result = backend.run_job(job, directory, threading.Event(), intents.append)
     assert '--allow-authorized-emission' not in apps.calls[0]
     assert [c['kind'] for c in apps.commands] == ['cancel']
     assert not intents and result['outcome'] == 'UNKNOWN'
+    rows = [r.pen_launch for r in caplog.records if hasattr(r, 'pen_launch')]
+    request = next(r for r in rows if r['phase'] == 'launch_requested')
+    callback = next(r for r in rows if r['phase'] == 'callback_enter')
+    assert callback['monotonic'] < request['prepare_deadline']
+    phases = [r['phase'] for r in rows]
+    assert phases.index('ticket_wait_return') < phases.index('connection_accepted') < phases.index('ready_read_return')
+    assert 'ticket_wait_rejected' not in phases
 
 
 @pytest.mark.parametrize('failure', ['application.json', 'intent'])
@@ -238,7 +247,8 @@ def test_cancel_during_durable_intent_never_dispatches(setup):
     assert result['outcome'] == 'UNKNOWN'
 
 
-def test_late_launch_callback_keeps_application_owned(setup):
+def test_late_launch_callback_keeps_application_owned(setup, caplog):
+    caplog.set_level(logging.DEBUG, logger='blender_mcp.pen_app.launch')
     backend, apps, job, directory = setup('late_completion')
     backend.cleanup_seconds = .01
     result = backend.run_job(job, directory, threading.Event(), lambda binding: None)
@@ -248,6 +258,13 @@ def test_late_launch_callback_keeps_application_owned(setup):
     apps.worker.join(1)
     assert ticket.application is apps.app
     assert result['outcome'] == 'UNKNOWN'
+    rows = [r.pen_launch for r in caplog.records if hasattr(r, 'pen_launch')]
+    rejected = next(r for r in rows if r['phase'] == 'ticket_wait_rejected')
+    entered = next(r for r in rows if r['phase'] == 'callback_enter')
+    assert rejected['prepare_deadline'] <= rejected['monotonic'] < entered['monotonic']
+    assert not rejected['completed'] and not rejected['cancelled']
+    assert rejected['ticket'] == entered['ticket'] == id(ticket)
+    assert not any(r['phase'] == 'connection_accepted' for r in rows)
 
 
 @pytest.mark.parametrize('data', [b'[]', b'{"a":1,"a":2}', b'{"a":NaN}', b'{"a":1e999}', b'{"a":"\xff"}'])
@@ -353,7 +370,8 @@ def test_cocoa_queries_turn_host_main_runloop_from_worker():
     assert seen == ['refresh']
 
 
-def test_host_loop_stall_cancels_unstarted_launch_operation():
+def test_host_loop_stall_cancels_unstarted_launch_operation(caplog):
+    caplog.set_level(logging.DEBUG, logger='blender_mcp.pen_app.launch')
     queued = []
     bridge = object.__new__(DarwinApplications)
     bridge.main_loop = SimpleNamespace(call_soon_threadsafe=queued.append)
@@ -370,6 +388,10 @@ def test_host_loop_stall_cancels_unstarted_launch_operation():
     assert not thread.is_alive() and 'UNKNOWN' in errors[0]
     queued[0]()
     assert not ran
+    rows = [r.pen_launch for r in caplog.records if hasattr(r, 'pen_launch')]
+    assert next(r for r in rows if r['phase'] == 'main_wait_timeout')['cancelled']
+    assert not next(r for r in rows if r['phase'] == 'main_dispatch')['admitted']
+    assert not any(r['phase'] == 'runloop_enter' for r in rows)
 
 
 def test_endpoint_cleanup_error_still_observes_retained_application(setup, monkeypatch):
@@ -538,3 +560,71 @@ def test_complete_job_releases_only_matching_coordinator_lease(setup, tmp_path, 
         assert len(apps.calls) == 1
     finally:
         close(jobs)
+
+
+@pytest.mark.parametrize('cancel_await', [False, True])
+def test_callback_trace_survives_async_wait_cancellation(cancel_await, caplog):
+    """Real main asyncio + worker bridge, entirely fake Cocoa and callback queue."""
+    caplog.set_level(logging.DEBUG, logger='blender_mcp.pen_app.launch')
+    bridge = object.__new__(DarwinApplications)
+    callback = []
+    turns = []
+    config = SimpleNamespace(**{name: lambda value: None for name in
+        ('setCreatesNewApplicationInstance_', 'setActivates_', 'setAddsToRecentItems_', 'setArguments_')})
+    def launch(url, configuration, completion):
+        assert threading.current_thread() is threading.main_thread()
+        callback.append(completion)
+    def turn(*args):
+        assert threading.current_thread() is threading.main_thread()
+        turns.append(True)
+    bridge.appkit = SimpleNamespace(NSWorkspaceOpenConfiguration=SimpleNamespace(configuration=lambda: config),
+        NSWorkspace=SimpleNamespace(sharedWorkspace=lambda: SimpleNamespace(
+            openApplicationAtURL_configuration_completionHandler_=launch)))
+    bridge.foundation = SimpleNamespace(NSURL=SimpleNamespace(fileURLWithPath_=lambda path: path),
+        NSRunLoop=SimpleNamespace(mainRunLoop=lambda: SimpleNamespace(runMode_beforeDate_=turn)),
+        NSDefaultRunLoopMode='default', NSDate=SimpleNamespace(date=lambda: 0))
+    ticket = LaunchTicket()
+    app = object()
+    async def scenario():
+        bridge.main_loop = asyncio.get_running_loop()
+        await asyncio.wait_for(asyncio.to_thread(bridge.launch, ticket, '/inert.app', []), 2)
+        wait_entered = threading.Event()
+        def wait_for_callback():
+            wait_entered.set()
+            return ticket.completed.wait(1)
+        waiting = asyncio.create_task(asyncio.to_thread(wait_for_callback))
+        assert await asyncio.to_thread(wait_entered.wait, 1)
+        if cancel_await:
+            waiting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiting
+        # Model a framework-owned concurrent callback, not an asyncio callback.
+        worker = threading.Thread(target=callback[0], args=(app, None))
+        worker.start()
+        await asyncio.to_thread(worker.join, 1)
+        assert not worker.is_alive()
+        if not cancel_await:
+            assert await waiting
+        await asyncio.to_thread(bridge.refresh)
+    asyncio.run(scenario())
+    assert ticket.completed.is_set() and ticket.application is app
+    assert len(callback) == 1 and len(turns) == 2
+    rows = [r.pen_launch for r in caplog.records if hasattr(r, 'pen_launch')]
+    phases = [r['phase'] for r in rows]
+    assert phases.index('workspace_enter') < phases.index('workspace_return') < phases.index('callback_enter')
+    entered = next(r for r in rows if r['phase'] == 'callback_enter')
+    assert not entered['main_thread'] and entered['ticket'] == id(ticket)
+    assert entered['has_application'] and not entered['has_error']
+    assert all(r['main_thread'] for r in rows if r['phase'] == 'runloop_enter')
+
+
+def test_diagnostic_sink_failure_does_not_lose_callback(monkeypatch):
+    from blender_mcp import pen_app
+    monkeypatch.setattr(pen_app._launch_log, 'isEnabledFor', lambda level: True)
+    def fail(*args, **kwargs):
+        raise OSError('inert diagnostic sink failure')
+    monkeypatch.setattr(pen_app._launch_log, 'debug', fail)
+    ticket = LaunchTicket()
+    app = object()
+    ticket.complete(app, None)
+    assert ticket.completed.is_set() and ticket.application is app

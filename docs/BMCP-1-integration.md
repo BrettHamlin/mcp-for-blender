@@ -301,3 +301,65 @@ The installed approved app is unchanged and does not acquire this protocol merel
 because the adapter source exists. Native receiver delivery, native release,
 geometry effect and art remain UNKNOWN; prior observation420/checkpoint423 results
 and whole-art FAIL are not re-tested or changed by host mocks.
+
+
+## CONCRETE429 launch diagnostic delta
+
+The combined direct review cleared base `584b6d98f1f32c05923510a234287700b6dda2a2`
+for bounded preparation (15/15 files); that verdict does not cover this delta.
+The original owner's 429 invocation returned UNKNOWN / quiescent true after
+11.6655 seconds; normal host return was 11.6677 seconds. Its retained application
+was terminated at profile time 11.7120 seconds, whose origin precedes the backend
+elapsed-time origin. Do not subtract those different origins as a callback delay.
+The invocation, result, trace, receipt, request, stroke, host-finished record,
+host log and invocation source were checked against retained actual-SHA256SUMS.
+
+Source trace: the direct host runs asyncio on the main thread and run_job in
+asyncio.to_thread. own_token precedes launch; it consumes part of the existing
+preparation budget. on_main dispatches launch to that asyncio loop and turns
+NSRunLoop before NSWorkspace submission. The callback stores the actual app and
+sets LaunchTicket.completed. The worker refreshes Cocoa while awaiting that event,
+then admits the connection and reads READY. A callback can complete during a
+refresh, including at the deadline; the existing cancellation/deadline check
+still runs before the next loop condition. No admission ordering is changed here.
+On rejection, endpoint closure precedes retained-app exit observation. The raw
+receipt's controller-disconnected error is consistent with this path, but does
+not establish the native connection's precise arrival time. It proves neither
+callback starvation nor a kernel-peer failure.
+
+No cause of 429 is established. The profile omitted callback entry and launch/
+refresh boundaries; absence of a callback profile row is not absence of callback
+execution. Only its eventual retained application is established. Fake Cocoa
+and main-asyncio tests can reproduce late completion or stalled dispatch by
+controlling them explicitly, but cannot attribute either mechanism to 429.
+
+The single proposed next diagnostic is to enable the existing adapter's new
+`blender_mcp.pen_app.launch` DEBUG logger in the original owner's existing inert
+invocation. Use a fast host-owned log sink, preserve its records through late
+custody cleanup, and restore its logging configuration afterward. No new runner,
+launch mode, wire field or runtime attempt is supplied or authorized by this delta.
+Each record has a monotonic timestamp, Python thread ID and main-thread flag;
+ticket and dispatch numbers are process-local object IDs, not process identities.
+No arguments, paths, audit tokens, challenge, app repr or protocol payload is logged.
+
+Read the first distinguishing observation against `launch_requested.prepare_deadline`:
+
+- `main_submit` / `main_dispatch` / `runloop_enter` / `runloop_return` distinguish
+  scheduling delay from time inside refresh; `workspace_enter` / `workspace_return`
+  bound submission. `main_wait_timeout.cancelled` says whether unstarted dispatch
+  was suppressed; `main_dispatch.admitted=false` confirms it never executed.
+- `callback_enter` and `ticket_completed` distinguish callback entry from ticket
+  publication. Compare their timestamps to the fixed deadline and
+  `ticket_wait_rejected` (completed/cancelled snapshots) or `ticket_wait_return`.
+  This observes Python callback entry, not when Cocoa first scheduled the block.
+- `connection_accepted` and `ready_read_enter/return` expose subsequent admission
+  without reading or logging credential bytes. Acceptance is not authentication;
+  all existing identity and final-evidence checks still apply.
+
+Logging is optional and sink exceptions do not discard callback custody. Logging
+can perturb timing; a blocked sink or missing records cannot establish native
+causality. No timeout increase, automatic retry, replay, fallback or relaxed
+identity check is included. Frozen schema `1a24c0…b0b` and native source
+`cd07a654…272f6c` are unchanged. Parent decides delta review and original owns any
+later inert native validation. Native delivery, release, effect and art gates
+remain unchanged; 429 remains UNKNOWN.

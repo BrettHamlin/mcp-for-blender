@@ -151,3 +151,36 @@ it; the final checks above ran after capacity recovered. Actual Cocoa launch,
 main-run-loop refresh, kernel attribution and native cancellation/release remain
 unverified on the app route. Original426 compile/link evidence and these fakes
 are not native acceptance. No extra review agent was started.
+
+
+## CONCRETE429 diagnostic self-review
+
+Instrumentation only; diagnosis inconclusive, no native fix or acceptance claimed.
+Base combined direct review: 15/15 READY at `584b6d98f1f32c05923510a234287700b6dda2a2`
+(`/private/tmp/bmcp-cross-review.8qiGn0/REVIEW.md`). This delta has not received
+independent review. Only pen_app.py, pen_custody.py, existing custody tests and
+these two documents change. Frozen native source/schema, wire, deadlines,
+identity/custody, UNKNOWN, default PREPARE and no-replay behavior remain intact.
+
+Focused inert verification: 137 passed (prior 134 plus two parameter cases for
+fake-Cocoa callback after normal/cancelled async await and one failing diagnostic
+sink case). Existing late-callback and stalled-main-loop tests now assert the
+trace distinguishes deadline rejection from unstarted-dispatch suppression;
+existing PREPARE test asserts timely completion precedes connection/read admission.
+The fake framework test uses actual main-thread asyncio, to_thread launch/refresh,
+and a separate Python callback thread with a retained application object. It
+never loads Cocoa or queries real kernel identity. The existing public MCP
+cancelled-await and identity mismatch cases also pass. Test command:
+
+```
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider tests/test_bmcp_custody.py tests/test_bmcp_revision.py tests/test_bmcp_pen.py tests/test_bmcp_tools.py tests/test_bmcp_control.py
+```
+
+Only locally mocked IPC was used. No native app, listener/preflight/input, signing,
+installation, TCC change or original-worktree modification occurred. The full
+upstream baseline with six known missing-config failures was not repeated for
+this diagnostic delta. `git diff --check` passes. Source review confirms every
+new log contains host timing/control booleans only; log-sink exceptions are
+contained. There is no attribution of 429 to TCC, pen, geometry, callback loss or
+main-loop starvation. The integration document defines one concrete diagnostic
+at the existing boundary for the parent/original to consider before native use.

@@ -2,11 +2,28 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 from concurrent.futures import Future, TimeoutError
 from pathlib import Path
 import struct
 import sys
 import threading
+import time
+
+
+_launch_log = logging.getLogger(__name__ + '.launch')
+
+
+def launch_diagnostic(phase, **fields):
+    """Opt-in host timing only; never serialize app objects or protocol secrets."""
+    if _launch_log.isEnabledFor(logging.DEBUG):
+        record = dict(phase=phase, monotonic=time.monotonic(),
+                      thread=threading.get_ident(),
+                      main_thread=threading.current_thread() is threading.main_thread(), **fields)
+        try:
+            _launch_log.debug('pen launch %s', record, extra={'pen_launch': record})
+        except Exception:
+            pass  # A diagnostic sink must not break callback custody.
 
 
 class LaunchTicket:
@@ -17,9 +34,12 @@ class LaunchTicket:
         self.error = None
 
     def complete(self, application, error):
+        launch_diagnostic('callback_enter', ticket=id(self), has_application=application is not None,
+                          has_error=error is not None)
         self.application = application
         self.error = str(error) if error is not None else None
         self.completed.set()
+        launch_diagnostic('ticket_completed', ticket=id(self))
 
 
 class DarwinApplications:
@@ -38,19 +58,28 @@ class DarwinApplications:
         self.foundation = Foundation
 
     def on_main(self, operation):
+        dispatch_id = id(operation)
+        launch_diagnostic('main_submit', dispatch=dispatch_id)
         def refreshed():
             if threading.current_thread() is not threading.main_thread():
                 raise RuntimeError('Cocoa custody requires the host main thread')
             # NSRunningApplication's changing properties are cached until the
             # main run loop turns. NSDate.date() makes this a nonblocking turn.
+            launch_diagnostic('runloop_enter', dispatch=dispatch_id)
             self.foundation.NSRunLoop.mainRunLoop().runMode_beforeDate_(
                 self.foundation.NSDefaultRunLoopMode, self.foundation.NSDate.date())
-            return operation()
+            launch_diagnostic('runloop_return', dispatch=dispatch_id)
+            try:
+                return operation()
+            finally:
+                launch_diagnostic('main_operation_return', dispatch=dispatch_id)
         if threading.current_thread() is threading.main_thread():
             return refreshed()
         future = Future()
         def dispatch():
-            if future.set_running_or_notify_cancel():
+            admitted = future.set_running_or_notify_cancel()
+            launch_diagnostic('main_dispatch', dispatch=dispatch_id, admitted=admitted)
+            if admitted:
                 try:
                     future.set_result(refreshed())
                 except BaseException as exc:
@@ -59,7 +88,8 @@ class DarwinApplications:
         try:
             return future.result(timeout=1)
         except TimeoutError:
-            future.cancel()  # Skip dispatch if it has not started; never retry.
+            cancelled = future.cancel()  # Skip dispatch if it has not started; never retry.
+            launch_diagnostic('main_wait_timeout', dispatch=dispatch_id, cancelled=cancelled)
             raise RuntimeError('Host main run loop unavailable; custody UNKNOWN')
 
     def refresh(self):
@@ -73,8 +103,10 @@ class DarwinApplications:
             config.setAddsToRecentItems_(False)
             config.setArguments_(arguments)
             url = self.foundation.NSURL.fileURLWithPath_(str(app_path))
+            launch_diagnostic('workspace_enter', ticket=id(ticket))
             self.appkit.NSWorkspace.sharedWorkspace().openApplicationAtURL_configuration_completionHandler_(
                 url, config, ticket.complete)
+            launch_diagnostic('workspace_return', ticket=id(ticket))
         self.on_main(launch)
 
     def fresh(self, pid):
